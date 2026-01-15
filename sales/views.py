@@ -1,142 +1,198 @@
-from django.shortcuts import render, get_object_or_404, redirect
-from django.forms import modelformset_factory
-from django.db.models import Sum
+from rest_framework import generics, serializers
+from rest_framework.permissions import IsAuthenticated
+from .models import Sales
+from .serializers import SalesSerializer
 from visits.models import Visit
-from sales.models import Sales, SalesItem
 from payment.models import Payment
-from django.contrib import messages
+from django.db import transaction  
+from products.models import ProductInterest  
+from decimal import Decimal
 
-def make_sales_order(request, visit_id):
-    if request.user.is_authenticated:
-            visit = get_object_or_404(Visit, id=visit_id)
 
-            # Ensure Sales record exists
-            if not visit.sales:
-                sale = Sales.objects.create(company=visit.company, added_by=request.user)
-                if hasattr(visit.company, "product_interests"):
-                    sale.product_interests.set(visit.company.product_interests.all())
-                visit.sales = sale
-                visit.save()
-            else:
-                sale = visit.sales
+class CreateSalesFromVisit(generics.CreateAPIView):
+    serializer_class = SalesSerializer
+    permission_classes = [IsAuthenticated]
 
-            products = sale.product_interests.all()
+    def get_queryset(self):
+        return Sales.objects.filter(added_by=self.request.user)
 
-            # Clean orphan items
-            SalesItem.objects.filter(sales=sale, product__isnull=True).delete()
+    @transaction.atomic
+    def perform_create(self, serializer):
+        visit_id = self.kwargs.get("visit_id")
+        if not visit_id:
+            raise serializers.ValidationError({"visit": "Visit ID is required in URL."})
 
-            # Create missing items
-            existing_ids = set(SalesItem.objects.filter(sales=sale).values_list("product_id", flat=True))
-            for product in products:
-                if product.id not in existing_ids:
-                    SalesItem.objects.create(sales=sale, product=product, price=0.0)
+        try:
+            visit = Visit.objects.get(id=visit_id)
+        except Visit.DoesNotExist:
+            raise serializers.ValidationError({"visit": f"Visit with id {visit_id} does not exist."})
 
-            queryset = SalesItem.objects.filter(sales=sale).order_by("id")
-            SalesItemFormSet = modelformset_factory(SalesItem, fields=("price",), extra=0)
+        items_data = self.request.data.get("items", [])
+        is_order_final = self.request.data.get("is_order_final", False)
+        status = self.request.data.get("status", None)
+        reason_lost = self.request.data.get("reason_lost", None)
 
-            items_with_payment_info = []
-            for item in sale.items.all():
-                total_paid = item.payments.aggregate(total=Sum("amount"))["total"] or 0
-                remaining = (item.price or 0) - total_paid
-                items_with_payment_info.append({
-                    "item": item,
-                    "total_paid": total_paid,
-                    "remaining": remaining,
+
+        for item in items_data:
+            product_interest_id = item.get("product_interest")
+            entered_price = Decimal(str(item.get("price", 0)))
+
+            if not product_interest_id:
+                continue  
+
+            try:
+                product_interest = ProductInterest.objects.select_related("product").get(id=product_interest_id)
+                product_price = Decimal(str(product_interest.product.price))
+            except ProductInterest.DoesNotExist:
+                raise serializers.ValidationError({
+                    "items": f"ProductInterest with id {product_interest_id} does not exist."
                 })
 
-            if request.method == "POST":
-                formset = SalesItemFormSet(request.POST, queryset=queryset)
-                contract_outcome = request.POST.get("contract_outcome")
-                is_payment_collected = request.POST.get("is_payment_collected")
-                reason_lost = request.POST.get("reason_lost", "")
-                is_final_order = request.POST.get("is_final_order") == "on"
+            if entered_price > product_price:
+                raise serializers.ValidationError({
+                    "price": f"Entered price ({entered_price}) cannot be greater than product price ({product_price})."
+                })
 
-                if formset.is_valid():
-                    formset.save()
+       
+        existing_sale = Sales.objects.filter(
+            customer=visit.company,
+            added_by=self.request.user
+        ).first()
 
-                    # ===== Closing Stage Logic =====
-                    if is_final_order and contract_outcome == "Won":
-                        # Save newly collected payments first
-                        for obj in items_with_payment_info:
-                            item = obj["item"]
-                            collected_value = request.POST.get(f"collected_{item.id}")
-                            if collected_value:
-                                collected_value = float(collected_value)
-                                if collected_value > 0:
-                                    Payment.objects.create(
-                                        sales=sale,
-                                        sales_item=item,
-                                        amount=collected_value,
-                                    )
+        if existing_sale:
+            update_data = {
+                "items": items_data
+            }
 
-                        # ===== NEW: Closing stage when fully paid manually selected =====
-                        if is_payment_collected == "Yes-Full":
-                            sale.status = "Won Paid"
-                            if sale.company:
-                                sale.company.acquisition_stage = "Closing"
-                                sale.company.save()
+            if "is_order_final" in self.request.data:
+                update_data["is_order_final"] = is_order_final
+            if status:
+                update_data["status"] = status
+            if reason_lost:
+                update_data["reason_lost"] = reason_lost
 
-                        else:
-                            # ===== Fixed: Determine payment status automatically =====
-                            total_amount = sale.items.aggregate(total=Sum("price"))["total"] or 0
-                            total_collected = sale.payments.aggregate(total=Sum("amount"))["total"] or 0
-                            remaining_balance = total_amount - total_collected
+            serializer.instance = existing_sale
+            serializer.update(existing_sale, update_data)
+            sale = existing_sale
+        else:
+            sale = serializer.save(
+                customer=visit.company,
+                added_by=self.request.user,
+                is_order_final=is_order_final,
+                items=items_data,
+                status=status if status else "Open",
+                reason_lost=reason_lost,
+            )
 
-                            # ✅ FIX: use strict positive check for remaining balance
-                            if remaining_balance > 0:
-                                sale.status = "Won Pending Payment"
-                                if sale.company:
-                                    sale.company.acquisition_stage = "Payment Followup"
-                                    sale.company.save()
-                            else:
-                                sale.status = "Won Paid"
-                                if sale.company:
-                                    sale.company.acquisition_stage = "Payment Followup"
-                                    sale.company.save()
+        # ⚡ Handle acquisition stage
+        if visit.company.acquisition_stage not in ["Closing", "Payment Followup"]:
+            if any(float(item.get("price", 0)) > 0 for item in items_data):
+                visit.company.acquisition_stage = "Proposal or Negotiation"
 
-                        sale.contract_outcome = contract_outcome
-                        sale.reason_lost = reason_lost
-                        sale.is_order_final = True
-                        sale.save()
+        if visit.company.acquisition_stage == "Closing" or status in ["Lost", "Won", "Paid"]:
+            visit.company.acquisition_stage = "Closing"
 
-                    # ===== Proposal / Non-final Orders =====
-                    elif not is_final_order and sale.items.exists():
-                        if sale.company:
-                            sale.company.acquisition_stage = "Proposal or Negotiation"
-                            sale.company.save()
+        # ⚡ Handle payments
+        payments_input = self.request.data.get("payments", [])
+        total_sale_price = sum(Decimal(item.get("price", 0)) for item in items_data)
+        total_paid_so_far = sum(Decimal(p.amount) for p in sale.payments.all())
 
-                    elif not sale.items.exists():
-                        if sale.company:
-                            sale.company.acquisition_stage = "Qualifying"
-                            sale.company.save()
+        for pay_item in payments_input:
+            amount = pay_item.get("amount")
+            if amount is None:
+                continue
 
-                    return redirect("visit_detail", visit_id=visit.id)
-            else:
-                formset = SalesItemFormSet(queryset=queryset)
+            try:
+                amount = Decimal(str(amount))
+            except:
+                raise serializers.ValidationError({"amount": "Invalid payment amount."})
 
-            # Totals
-            total_amount = sale.items.aggregate(total=Sum("price"))["total"] or 0
-            total_collected = sale.payments.aggregate(total=Sum("amount"))["total"] or 0
-            remaining_balance = total_amount - total_collected
+            remaining = total_sale_price - total_paid_so_far
+            if amount > remaining:
+                raise serializers.ValidationError(
+                    {"amount": f"Cannot pay more than remaining balance ({remaining})."}
+                )
 
-            stage = visit.company.acquisition_stage if visit.company else "Proposal or Negotiation"
-            show_payment_followup_only = stage == "Payment Followup"
-            show_closing = stage in ["Closing", "Payment Followup", "Completed"] or (stage == "Proposal or Negotiation" and sale.is_order_final)
+            Payment.objects.create(sales=sale, amount=amount)
+            visit.company.acquisition_stage = "Payment Followup"
+            total_paid_so_far += amount
 
-            return render(request, "users/make_sales_order.html", {
-                "visit": visit,
-                "sales": sale,
-                "formset": formset,
-                "form_product_pairs": [(form, form.instance.product) for form in formset.forms],
-                "stage": stage,
-                "total_amount": total_amount,
-                "total_collected": total_collected,
-                "remaining_balance": remaining_balance,
-                "show_closing": show_closing,
-                "show_payment_followup_only": show_payment_followup_only,
-                "items_with_payment_info": items_with_payment_info,
-            })
-    else:
-        messages.error(request, "You must login first to access the page")
-        return redirect("login")
+        # ✅ Update sale status if fully paid
+        if total_paid_so_far >= total_sale_price and total_sale_price > 0:
+            sale.status = "Paid"
+            sale.save()
+            if not payments_input:
+                visit.company.acquisition_stage = "Closing"
+
+        visit.company.save()
+        return sale
+
+
+
+
+from rest_framework import generics, permissions
+from .models import Sales
+from .serializers import SalesSerializer
+from django.db.models import Sum, F
+
+class SalesListView(generics.ListAPIView):
+    """
+    Returns all sales added by the logged-in user with related items, 
+    customers, and totals, excluding those with total price = 0.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SalesSerializer
+
+    def get_queryset(self):
+        user = self.request.user  
+        return (
+            Sales.objects
+            .select_related("customer", "added_by")
+            .prefetch_related("items__product", "product_interests")
+            .annotate(total_price_calc=Sum(F("items__price")))
+            .filter(total_price_calc__gt=0, added_by=user)  
+            .order_by("-created_at")
+        )
+
+
+
+class AdminSalesListView(generics.ListAPIView):
+    
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SalesSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        return (
+            Sales.objects
+            .select_related("customer", "added_by")
+            .prefetch_related("items__product", "product_interests")
+            .annotate(total_price_calc=Sum(F("items__price")))
+            .filter(total_price_calc__gt=0) 
+            .exclude(added_by=user)           
+            .order_by("-created_at")
+        )
+
+
+
+
+class SalesDetailView(generics.RetrieveAPIView):
+   
+    queryset = (
+        Sales.objects.select_related("customer", "added_by")
+        .prefetch_related("items__product", "product_interests")
+    )
+    serializer_class = SalesSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    lookup_field = "id"
+
+
+class AdminSalesDetailView(generics.RetrieveAPIView):
+    queryset = (
+        Sales.objects.select_related("customer", "added_by")
+        .prefetch_related("items__product", "product_interests")
+    )
+    serializer_class = SalesSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    lookup_field = "id"
 
